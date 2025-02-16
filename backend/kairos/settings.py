@@ -11,7 +11,12 @@ INSTALLED_APPS = [
     'rest_framework_simplejwt',
     'corsheaders',
     'backend.apps.authentication',  # Authentication app
-    
+
+
+MIDDLEWARE = [
+    'corsheaders.middleware.CorsMiddleware',  # Enable CORS
+    'django.middleware.common.CommonMiddleware',
+]    
 
     # Local apps
     'user_profiles',
