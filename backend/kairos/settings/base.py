@@ -35,6 +35,7 @@ INSTALLED_APPS = [
     'apps.social',
     'apps.ai_engine',
     'apps.compliance',
+    
 ]
 
 MIDDLEWARE = [
@@ -42,8 +43,9 @@ MIDDLEWARE = [
     ...
 ]
 
-ROOT_URLCONF = 'config.urls'
+ROOT_URLCONF = 'kairos.urls'
 WSGI_APPLICATION = 'config.wsgi.application'
+AUTH_USER_MODEL = 'users.User'
 
 DATABASES = {
     'default': {
