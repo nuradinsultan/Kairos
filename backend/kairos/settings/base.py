@@ -44,8 +44,31 @@ MIDDLEWARE = [
 ]
 
 ROOT_URLCONF = 'kairos.urls'
-WSGI_APPLICATION = 'config.wsgi.application'
-AUTH_USER_MODEL = 'users.User'
+WSGI_APPLICATION = 'kairos.wsgi.application'
+AUTH_USER_MODEL = 'kairos.User'
+AUTHENTICATION_BACKENDS = [
+    'kairos.auth_backends.MultiFieldAuthBackend',
+    'django.contrib.auth.backends.ModelBackend',
+]
+
+# Password validation
+AUTH_PASSWORD_VALIDATORS = [
+    {
+        'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator',
+    },
+    {
+        'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator',
+        'OPTIONS': {
+            'min_length': 8,
+        }
+    },
+    {
+        'NAME': 'django.contrib.auth.password_validation.CommonPasswordValidator',
+    },
+    {
+        'NAME': 'django.contrib.auth.password_validation.NumericPasswordValidator',
+    },
+]
 
 DATABASES = {
     'default': {
