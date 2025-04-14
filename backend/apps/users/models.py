@@ -1,225 +1,364 @@
+import uuid
 import phonenumbers
 from django.db import models
-from django.contrib.auth.models import (
-    AbstractBaseUser, 
-    BaseUserManager, 
-    PermissionsMixin
-)
-from django.core.validators import RegexValidator
+from django.contrib.auth.models import AbstractBaseUser, PermissionsMixin
+from django.core.validators import RegexValidator, MinValueValidator
 from django.core.exceptions import ValidationError
 from django.utils.translation import gettext_lazy as _
 from django.utils import timezone
+from django.conf import settings
+from django.core.mail import send_mail
+from django.template.loader import render_to_string
 
-# Best Practice: Isolate manager class
-class CustomUserManager(BaseUserManager):
-    """Best Practice: Document all methods"""
-    
-    def _validate_creation_fields(self, identifier: str) -> tuple[str, str]:
-        """Validate email/phone and return normalized values"""
-        email, phone = None, None
-        
-        if '@' in identifier:
-            email = self.normalize_email(identifier)
-            if not email:
-                raise ValueError('Invalid email format')
-        else:
-            if not identifier.startswith('+251'):
-                raise ValueError('Only Ethiopian (+251) numbers allowed')
-            try:
-                phone = phonenumbers.parse(identifier, None)
-                if not phonenumbers.is_valid_number(phone):
-                    raise ValueError('Invalid phone number')
-                phone = phonenumbers.format_number(
-                    phone, 
-                    phonenumbers.PhoneNumberFormat.E164
-                )
-            except phonenumbers.NumberParseException as e:
-                raise ValueError(f'Phone validation failed: {str(e)}')
-        
-        return email, phone or identifier
-
-    def create_user(self, identifier: str, password: str = None, **extra_fields):
-        """Best Practice: Type hints and docstrings"""
-        if not identifier:
-            raise ValueError('Identifier (email/phone) required')
-            
-        email, phone = self._validate_creation_fields(identifier)
-        
-        # Best Practice: Explicit field setting
-        user = self.model(
-            email=email,
-            phone_number=phone,
-            **extra_fields
-        )
-        
-        # Best Practice: Password validation
-        if password:
-            user.set_password(password)
-        else:
-            user.set_unusable_password()
-            
-        user.save(using=self._db)
-        return user
-
-    def create_superuser(self, identifier: str, password: str, **extra_fields):
-        """Best Practice: Explicit permission flags"""
-        extra_fields.setdefault('is_staff', True)
-        extra_fields.setdefault('is_superuser', True)
-        extra_fields.setdefault('is_verified', True)
-        
-        if extra_fields.get('is_staff') is not True:
-            raise ValueError('Superuser must have is_staff=True')
-            
-        return self.create_user(identifier, password, **extra_fields)
-
-# Best Practice: Separate validator functions
-def validate_ethiopian_phone(value: str) -> None:
-    """Production-grade phone validation"""
-    try:
-        phone = phonenumbers.parse(value, None)
-        if not phonenumbers.is_valid_number(phone):
-            raise ValidationError(
-                _('%(value)s is not a valid phone number'),
-                params={'value': value},
-            )
-        if phonenumbers.region_code_for_number(phone) != 'ET':
-            raise ValidationError(
-                _('Only Ethiopian (+251) numbers are allowed'),
-                code='invalid_region'
-            )
-    except phonenumbers.NumberParseException as e:
-        raise ValidationError(
-            _('Invalid phone format: %(error)s'),
-            params={'error': str(e)},
-            code='invalid_format'
-        )
+from .managers import CustomUserManager
+from .enums import (
+    OnboardingStage,
+    AccountType,
+    UserRole,
+    KYCStatus,
+    AgreementType,
+    DocumentType
+)
 
 class User(AbstractBaseUser, PermissionsMixin):
-    """Best Practice: Comprehensive field definitions"""
+    """
+    Custom user model with Ethiopian phone verification and comprehensive financial features
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     
-    # Contact Fields
-    email = models.EmailField(
-        _('email address'),
-        max_length=255,
-        unique=True,
-        blank=True,
-        null=True,
-        help_text=_('User email address'),
-        error_messages={
-            'unique': _('This email is already registered'),
-        },
-        db_index=True  # Best Practice: Index frequently queried fields
+    # ======================
+    # AUTHENTICATION FIELDS
+    # ======================
+    phone_regex = RegexValidator(
+        regex=r'^\+251\d{9}$',
+        message=_("Phone must be Ethiopian format: '+251xxxxxxxxx'.")
     )
-    
     phone_number = models.CharField(
         _('phone number'),
-        max_length=15,
+        max_length=13,
         unique=True,
-        blank=True,
-        null=True,
-        validators=[validate_ethiopian_phone],
-        help_text=_('Ethiopian number in E.164 format (+251XXXXXXXXX)'),
-        error_messages={
-            'unique': _('This phone number is already registered'),
-        },
-        db_index=True
+        validators=[phone_regex]
+    )
+    email = models.EmailField(_('email address'), unique=True, blank=True, null=True)
+    
+    # ==================
+    # SECURITY FIELDS
+    # ==================
+    otp = models.CharField(max_length=6, blank=True, null=True)
+    otp_expiry = models.DateTimeField(blank=True, null=True)
+    pin = models.CharField(_('transaction PIN'), max_length=6, blank=True)
+    is_verified = models.BooleanField(_('verified'), default=False)
+    is_active = models.BooleanField(_('active'), default=True)
+    is_staff = models.BooleanField(_('staff status'), default=False)
+    
+    # ======================
+    # ONBOARDING PROGRESS
+    # ======================
+    onboarding_stage = models.CharField(
+        _('onboarding stage'),
+        max_length=20,
+        choices=OnboardingStage.choices(),
+        default=OnboardingStage.EMAIL_VERIFICATION.value
+    )
+    onboarding_data = models.JSONField(_('onboarding data'), default=dict, blank=True)
+    
+    # ======================
+    # ACCOUNT CONFIGURATION
+    # ======================
+    role = models.CharField(
+        _('role'),
+        max_length=22,
+        choices=UserRole.choices(),
+        default=UserRole.RETAIL_INVESTOR.value
+    )
+    primary_account_type = models.CharField(
+        _('primary account type'),
+        max_length=10,
+        choices=AccountType.choices(),
+        default=AccountType.INDIVIDUAL.value
+    )
+    secondary_account_types = ArrayField(
+        models.CharField(max_length=10, choices=AccountType.choices()),
+        default=list,
+        blank=True
+    )
+    active_account = models.CharField(
+        _('active account'),
+        max_length=10,
+        choices=AccountType.choices(),
+        default=AccountType.INDIVIDUAL.value
     )
     
-    # Auth Fields
-    username = models.CharField(
-        _('username'),
-        max_length=30,
-        unique=True,
-        help_text=_(
-            'Required. 30 characters or fewer. '
-            'Letters, digits and @/./+/-/_ only.'
-        ),
-        error_messages={
-            'unique': _('This username is already taken'),
-        },
+    # ======================
+    # DEMO ACCOUNT FEATURES
+    # ======================
+    demo_balance = models.DecimalField(
+        _('demo balance'),
+        max_digits=15,
+        decimal_places=2,
+        default=100000.00,
+        validators=[MinValueValidator(0)]
     )
+    demo_reset_count = models.PositiveIntegerField(_('demo resets'), default=0)
+    last_demo_reset = models.DateTimeField(_('last demo reset'), null=True, blank=True)
     
-    # Status Fields
-    is_active = models.BooleanField(
-        _('active'),
-        default=True,
-        help_text=_('Designates whether this user should be treated as active')
-    )
-    
-    is_staff = models.BooleanField(
-        _('staff status'),
-        default=False,
-        help_text=_('Designates whether the user can log into this admin site')
-    )
-    
-    is_verified = models.BooleanField(
-        _('verified'),
-        default=False,
-        help_text=_('Designates whether the user has completed verification')
-    )
-    
-    # Timestamps
-    date_joined = models.DateTimeField(
-        _('date joined'),
-        default=timezone.now,
-        editable=False
-    )
-    
-    last_login = models.DateTimeField(
-        _('last login'),
-        auto_now=True,
-        editable=False
-    )
-    
-    # Best Practice: Define choices for future extensibility
-    LANGUAGE_CHOICES = [
-        ('en', 'English'),
-        ('am', 'Amharic'),
-    ]
-    language = models.CharField(
-        max_length=2,
-        choices=LANGUAGE_CHOICES,
-        default='en'
-    )
+    # ======================
+    # TIMESTAMPS
+    # ======================
+    date_joined = models.DateTimeField(_('date joined'), auto_now_add=True)
+    last_login = models.DateTimeField(_('last login'), auto_now=True)
+    updated_at = models.DateTimeField(_('updated at'), auto_now=True)
 
     objects = CustomUserManager()
 
-    USERNAME_FIELD = 'username'
-    REQUIRED_FIELDS = []
+    USERNAME_FIELD = 'phone_number'
+    REQUIRED_FIELDS = ['email', 'role']
 
     class Meta:
         verbose_name = _('user')
         verbose_name_plural = _('users')
-        ordering = ['-date_joined']  # Best Practice: Default ordering
-        indexes = [  # Best Practice: Composite indexes
-            models.Index(fields=['email', 'phone_number']),
+        ordering = ['-date_joined']
+        indexes = [
+            models.Index(fields=['phone_number']),
+            models.Index(fields=['email']),
+            models.Index(fields=['role']),
+            models.Index(fields=['is_verified']),
+            models.Index(fields=['onboarding_stage']),
+            models.Index(fields=['active_account']),
         ]
 
-    def __str__(self) -> str:
-        return self.username
+    def __str__(self):
+        return f"{self.phone_number} ({self.get_role_display()})"
 
-    def clean(self) -> None:
-        """Best Practice: Comprehensive validation"""
+    def clean(self):
+        """Validate Ethiopian phone number and account consistency"""
         super().clean()
         
-        if not self.email and not self.phone_number:
-            raise ValidationError(
-                _('User must have either email or phone number'),
-                code='missing_contact'
+        # Phone number validation
+        try:
+            phone = phonenumbers.parse(self.phone_number, None)
+            if not phonenumbers.is_valid_number(phone):
+                raise ValidationError(_("Invalid phone number"))
+            if phonenumbers.region_code_for_number(phone) != 'ET':
+                raise ValidationError(_("Only Ethiopian numbers allowed"))
+        except phonenumbers.NumberParseException:
+            raise ValidationError(_("Invalid phone number format"))
+        
+        # Account type validation
+        if self.active_account not in [self.primary_account_type] + self.secondary_account_types:
+            raise ValidationError(_("Active account must be primary or secondary account type"))
+
+    # ======================
+    # OTP METHODS
+    # ======================
+    def generate_otp(self):
+        """Generate and save a 6-digit OTP valid for 5 minutes"""
+        import random
+        self.otp = str(random.randint(100000, 999999))
+        self.otp_expiry = timezone.now() + timezone.timedelta(minutes=5)
+        self.save()
+        return self.otp
+
+    def verify_otp(self, otp):
+        """Verify provided OTP and mark user as verified if valid"""
+        if self.otp == otp and self.otp_expiry > timezone.now():
+            self.is_verified = True
+            self.otp = None
+            self.otp_expiry = None
+            self.save()
+            return True
+        return False
+
+    # ======================
+    # ONBOARDING METHODS
+    # ======================
+    def send_verification_email(self):
+        """Send email verification link"""
+        if not self.email:
+            raise ValueError("User has no email address configured")
+        
+        context = {
+            'user': self,
+            'verification_url': (
+                f"{settings.FRONTEND_URL}/verify-email/"
+                f"{self.id}/{self.email_verification_token}/"
             )
-            
-        if self.phone_number:
-            validate_ethiopian_phone(self.phone_number)
+        }
+        
+        send_mail(
+            subject=_('Verify Your Email'),
+            message=render_to_string('emails/verification.txt', context),
+            html_message=render_to_string('emails/verification.html', context),
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[self.email],
+            fail_silently=False
+        )
 
-    def get_full_name(self) -> str:
-        """Best Practice: Standard user method implementation"""
-        return self.username
+    def progress_onboarding(self, new_stage):
+        """Progress user to next onboarding stage if valid"""
+        current_stage = OnboardingStage(self.onboarding_stage)
+        new_stage = OnboardingStage(new_stage)
+        
+        if new_stage.value > current_stage.value:
+            self.onboarding_stage = new_stage.value
+            self.save()
+            return True
+        return False
 
-    def get_short_name(self) -> str:
-        """Best Practice: Standard user method implementation"""
-        return self.username.split('@')[0] if '@' in self.username else self.username
+    # ======================
+    # DEMO ACCOUNT METHODS
+    # ======================
+    def reset_demo_balance(self):
+        """Reset demo account balance to initial value"""
+        if self.active_account != AccountType.DEMO.value:
+            raise ValueError("Can only reset demo account balance")
+        
+        self.demo_balance = 100000.00
+        self.demo_reset_count += 1
+        self.last_demo_reset = timezone.now()
+        self.save()
 
-    @property
-    def contact_info(self) -> str:
-        """Best Practice: Business logic as properties"""
-        return self.email or self.phone_number
+    # ======================
+    # ACCOUNT MANAGEMENT
+    # ======================
+    def add_secondary_account(self, account_type):
+        """Add a secondary account type if not already present"""
+        if account_type not in self.secondary_account_types:
+            self.secondary_account_types.append(account_type)
+            self.save()
+
+    def switch_active_account(self, account_type):
+        """Switch active account if available to user"""
+        if account_type in [self.primary_account_type] + self.secondary_account_types:
+            self.active_account = account_type
+            self.save()
+            return True
+        return False
+
+
+class UserProfile(models.Model):
+    """
+    Extended user profile information
+    """
+    user = models.OneToOneField(
+        User,
+        on_delete=models.CASCADE,
+        related_name='profile'
+    )
+    first_name = models.CharField(_('first name'), max_length=30)
+    last_name = models.CharField(_('last name'), max_length=30)
+    date_of_birth = models.DateField(_('date of birth'), null=True, blank=True)
+    
+    class Meta:
+        verbose_name = _('user profile')
+        verbose_name_plural = _('user profiles')
+
+    def __str__(self):
+        return f"{self.first_name} {self.last_name}"
+
+
+class KYCDocument(models.Model):
+    """
+    KYC document submission and processing
+    """
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name='kyc_documents'
+    )
+    document_type = models.CharField(
+        _('document type'),
+        max_length=20,
+        choices=DocumentType.choices()
+    )
+    document_front = models.FileField(
+        _('document front'),
+        upload_to='kyc/'
+    )
+    document_back = models.FileField(
+        _('document back'),
+        upload_to='kyc/',
+        blank=True,
+        null=True
+    )
+    status = models.CharField(
+        _('status'),
+        max_length=20,
+        choices=KYCStatus.choices(),
+        default=KYCStatus.PENDING.value
+    )
+    metadata = models.JSONField(_('metadata'), default=dict)
+    created_at = models.DateTimeField(_('created at'), auto_now_add=True)
+    reviewed_at = models.DateTimeField(_('reviewed at'), null=True, blank=True)
+    
+    class Meta:
+        verbose_name = _('KYC document')
+        verbose_name_plural = _('KYC documents')
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['user']),
+            models.Index(fields=['status']),
+        ]
+
+    def __str__(self):
+        return f"{self.user.phone_number} - {self.get_document_type_display()}"
+
+
+class Agreement(models.Model):
+    """
+    E-signature agreements tracking
+    """
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name='agreements'
+    )
+    agreement_type = models.CharField(
+        _('agreement type'),
+        max_length=50,
+        choices=AgreementType.choices()
+    )
+    version = models.CharField(_('version'), max_length=20)
+    content = models.TextField(_('content'))
+    ip_address = models.GenericIPAddressField(_('IP address'))
+    user_agent = models.TextField(_('user agent'))
+    signed_at = models.DateTimeField(_('signed at'), auto_now_add=True)
+    
+    class Meta:
+        verbose_name = _('agreement')
+        verbose_name_plural = _('agreements')
+        unique_together = ('user', 'agreement_type', 'version')
+        ordering = ['-signed_at']
+
+    def __str__(self):
+        return f"{self.user.phone_number} - {self.agreement_type} v{self.version}"
+
+
+class AuditLog(models.Model):
+    """
+    Audit trail for sensitive user actions
+    """
+    user = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='audit_logs'
+    )
+    action = models.CharField(_('action'), max_length=50)
+    ip_address = models.GenericIPAddressField(_('IP address'))
+    user_agent = models.TextField(_('user agent'), blank=True)
+    metadata = models.JSONField(_('metadata'), default=dict)
+    created_at = models.DateTimeField(_('created at'), auto_now_add=True)
+    
+    class Meta:
+        verbose_name = _('audit log')
+        verbose_name_plural = _('audit logs')
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['user']),
+            models.Index(fields=['action']),
+        ]
+
+    def __str__(self):
+        return f"{self.user.phone_number if self.user else 'System'} - {self.action}"
