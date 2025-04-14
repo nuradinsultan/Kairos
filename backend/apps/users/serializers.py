@@ -1,81 +1,300 @@
 from rest_framework import serializers
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
-from django.contrib.auth import authenticate
-from .models import User
+from django.utils.translation import gettext_lazy as _
+from django.core.validators import RegexValidator
+import phonenumbers
 
-class UserSerializer(serializers.ModelSerializer):
+from .models import (
+    User,
+    UserProfile,
+    KYCDocument,
+    Agreement,
+    AuditLog
+)
+from .enums import (
+    OnboardingStage,
+    AccountType,
+    UserRole,
+    DocumentType,
+    AgreementType
+)
+
+class PhoneNumberSerializer(serializers.Serializer):
+    """
+    Validates Ethiopian phone numbers
+    """
+    phone_number = serializers.CharField(
+        max_length=13,
+        validators=[
+            RegexValidator(
+                regex=r'^\+251\d{9}$',
+                message=_("Phone must be Ethiopian format: '+251xxxxxxxxx'.")
+            )
+        ]
+    )
+
+    def validate_phone_number(self, value):
+        try:
+            phone = phonenumbers.parse(value, None)
+            if not phonenumbers.is_valid_number(phone):
+                raise serializers.ValidationError(_("Invalid phone number"))
+            if phonenumbers.region_code_for_number(phone) != 'ET':
+                raise serializers.ValidationError(_("Only Ethiopian numbers allowed"))
+            return value
+        except phonenumbers.NumberParseException:
+            raise serializers.ValidationError(_("Invalid phone number format"))
+
+class OTPSerializer(serializers.Serializer):
+    """
+    Validates OTP submissions
+    """
+    phone_number = serializers.CharField(max_length=13)
+    otp = serializers.CharField(max_length=6)
+
+    def validate(self, data):
+        try:
+            user = User.objects.get(phone_number=data['phone_number'])
+            if not user.otp or user.otp != data['otp']:
+                raise serializers.ValidationError(_("Invalid OTP"))
+            if user.otp_expiry < timezone.now():
+                raise serializers.ValidationError(_("OTP has expired"))
+            return data
+        except User.DoesNotExist:
+            raise serializers.ValidationError(_("User not found"))
+
+class UserProfileSerializer(serializers.ModelSerializer):
+    """
+    Handles user profile data
+    """
+    class Meta:
+        model = UserProfile
+        fields = [
+            'first_name',
+            'last_name',
+            'date_of_birth'
+        ]
+
+class UserRegistrationSerializer(serializers.ModelSerializer):
+    """
+    Handles new user registration with phone verification
+    """
+    profile = UserProfileSerializer(required=True)
+    email = serializers.EmailField(required=True)
+
     class Meta:
         model = User
-        fields = ['id', 'username', 'email', 'phone_number', 'is_active', 'date_joined']
-        read_only_fields = ['id', 'is_active', 'date_joined']
-
-class RegisterSerializer(serializers.ModelSerializer):
-    password = serializers.CharField(write_only=True, required=True, style={'input_type': 'password'})
-    password2 = serializers.CharField(write_only=True, required=True, style={'input_type': 'password'})
-
-    class Meta:
-        model = User
-        fields = ['username', 'email', 'phone_number', 'password', 'password2']
+        fields = [
+            'phone_number',
+            'email',
+            'role',
+            'primary_account_type',
+            'profile'
+        ]
         extra_kwargs = {
-            'email': {'required': False},
-            'phone_number': {'required': False}
+            'phone_number': {'validators': [PhoneNumberSerializer().validate_phone_number]}
         }
 
-    def validate(self, attrs):
-        if attrs['password'] != attrs['password2']:
-            raise serializers.ValidationError({"password": "Password fields didn't match."})
-        
-        if not attrs.get('email') and not attrs.get('phone_number'):
-            raise serializers.ValidationError("Either email or phone number is required")
-        
-        return attrs
+    def validate_role(self, value):
+        if value not in [UserRole.RETAIL_INVESTOR.value, UserRole.INSTITUTIONAL_INVESTOR.value]:
+            raise serializers.ValidationError(
+                _("Only retail or institutional investor roles allowed during registration")
+            )
+        return value
 
     def create(self, validated_data):
-        validated_data.pop('password2')
-        user = User.objects.create_user(
-            identifier=validated_data.get('email') or validated_data.get('phone_number'),
-            username=validated_data['username'],
-            password=validated_data['password'],
-            email=validated_data.get('email'),
-            phone_number=validated_data.get('phone_number')
-        )
+        profile_data = validated_data.pop('profile')
+        user = User.objects.create_user(**validated_data)
+        UserProfile.objects.create(user=user, **profile_data)
         return user
 
-class CustomTokenObtainSerializer(TokenObtainPairSerializer):
+class OnboardingStatusSerializer(serializers.ModelSerializer):
+    """
+    Serializes onboarding progress
+    """
+    current_stage = serializers.SerializerMethodField()
+    completed = serializers.BooleanField(source='is_onboarding_complete', read_only=True)
+
+    class Meta:
+        model = User
+        fields = [
+            'current_stage',
+            'completed',
+            'onboarding_data'
+        ]
+        read_only_fields = fields
+
+    def get_current_stage(self, obj):
+        return {
+            'code': obj.onboarding_stage,
+            'display': OnboardingStage(obj.onboarding_stage).label
+        }
+
+class KYCDocumentSerializer(serializers.ModelSerializer):
+    """
+    Handles KYC document upload and status
+    """
+    document_type_display = serializers.CharField(
+        source='get_document_type_display',
+        read_only=True
+    )
+    status_display = serializers.CharField(
+        source='get_status_display',
+        read_only=True
+    )
+
+    class Meta:
+        model = KYCDocument
+        fields = [
+            'id',
+            'document_type',
+            'document_type_display',
+            'document_front',
+            'document_back',
+            'status',
+            'status_display',
+            'created_at',
+            'reviewed_at'
+        ]
+        read_only_fields = [
+            'id',
+            'status',
+            'status_display',
+            'created_at',
+            'reviewed_at'
+        ]
+
+    def validate_document_type(self, value):
+        if value not in dict(DocumentType.choices()):
+            raise serializers.ValidationError(_("Invalid document type"))
+        return value
+
+class AgreementSerializer(serializers.ModelSerializer):
+    """
+    Handles e-signature agreements
+    """
+    agreement_type_display = serializers.CharField(
+        source='get_agreement_type_display',
+        read_only=True
+    )
+
+    class Meta:
+        model = Agreement
+        fields = [
+            'id',
+            'agreement_type',
+            'agreement_type_display',
+            'version',
+            'content',
+            'signed_at'
+        ]
+        read_only_fields = [
+            'id',
+            'content',
+            'signed_at'
+        ]
+
+class AccountSwitchSerializer(serializers.Serializer):
+    """
+    Handles account switching between primary/secondary accounts
+    """
+    account_type = serializers.ChoiceField(choices=AccountType.choices())
+
+    def validate_account_type(self, value):
+        user = self.context['request'].user
+        if value not in [user.primary_account_type] + user.secondary_account_types:
+            raise serializers.ValidationError(
+                _("You don't have access to this account type")
+            )
+        return value
+
+class DemoAccountResetSerializer(serializers.Serializer):
+    """
+    Handles demo account balance reset
+    """
+    confirm = serializers.BooleanField(
+        required=True,
+        help_text=_("Must explicitly confirm reset")
+    )
+
+    def validate_confirm(self, value):
+        if not value:
+            raise serializers.ValidationError(
+                _("You must confirm the reset")
+            )
+        return value
+
+class AuditLogSerializer(serializers.ModelSerializer):
+    """
+    Serializes audit trail entries
+    """
+    user_display = serializers.SerializerMethodField()
+
+    class Meta:
+        model = AuditLog
+        fields = [
+            'id',
+            'user',
+            'user_display',
+            'action',
+            'ip_address',
+            'created_at'
+        ]
+        read_only_fields = fields
+
+    def get_user_display(self, obj):
+        return str(obj.user) if obj.user else "System"
+
+class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
+    """
+    Extended JWT serializer with additional user data
+    """
     def validate(self, attrs):
-        identifier = attrs.get('username')
-        password = attrs.get('password')
-        
-        if not identifier or not password:
-            raise serializers.ValidationError("Must include 'username' and 'password'")
-        
-        # Authenticate via email or phone
-        user = authenticate(
-            request=self.context.get('request'),
-            username=identifier,
-            password=password
-        )
-        
-        if not user:
-            raise serializers.ValidationError("Unable to log in with provided credentials")
-        
-        if not user.is_active:
-            raise serializers.ValidationError("User account is disabled")
-        
         data = super().validate(attrs)
-        refresh = self.get_token(user)
         
-        data['user'] = UserSerializer(user).data
-        data['refresh'] = str(refresh)
-        data['access'] = str(refresh.access_token)
-        
+        # Add custom claims
+        user = self.user
+        data.update({
+            'phone_number': user.phone_number,
+            'is_verified': user.is_verified,
+            'onboarding_stage': user.onboarding_stage,
+            'active_account': user.active_account,
+            'role': user.role
+        })
         return data
 
-class CustomTokenObtainPairSerializer(CustomTokenObtainSerializer):
-    @classmethod
-    def get_token(cls, user):
-        token = super().get_token(user)
-        token['username'] = user.username
-        token['email'] = user.email
-        token['phone_number'] = user.phone_number
-        return token
+class UserDetailSerializer(serializers.ModelSerializer):
+    """
+    Comprehensive user details serializer
+    """
+    profile = UserProfileSerializer(read_only=True)
+    role_display = serializers.CharField(
+        source='get_role_display',
+        read_only=True
+    )
+    account_type_display = serializers.CharField(
+        source='get_primary_account_type_display',
+        read_only=True
+    )
+    active_account_display = serializers.CharField(
+        source='get_active_account_display',
+        read_only=True
+    )
+
+    class Meta:
+        model = User
+        fields = [
+            'id',
+            'phone_number',
+            'email',
+            'role',
+            'role_display',
+            'primary_account_type',
+            'account_type_display',
+            'secondary_account_types',
+            'active_account',
+            'active_account_display',
+            'is_verified',
+            'onboarding_stage',
+            'profile'
+        ]
+        read_only_fields = fields
